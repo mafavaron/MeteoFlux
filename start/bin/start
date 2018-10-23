@@ -1,0 +1,16 @@
+#!/bin/sh
+
+# Pre-condition: neither data acquisition nor protocol are running.
+rm -f /var/run/usa_acq.pid
+
+# Set RAM disk no.0 accepting the default of 8 MByte of the 64 available (CAE-specific!)
+/sbin/mke2fs -q -m 0 /dev/ram0
+/bin/mount /dev/ram0 /mnt/ramdisk
+chown standard:standard /mnt/data
+chown standard:standard /mnt/logs
+chown standard:standard /mnt/ramdisk
+
+# Start data acquisition and protocol
+sudo -H -u standard /home/standard/bin/usa_usa1 /dev/ttyRS232 /home/standard/cfg/usa_usa1.cfg
+sudo -H -u standard /home/standard/datalogger/main.py&
+sudo -H -u standard /home/standard/bin/monitor.py&
