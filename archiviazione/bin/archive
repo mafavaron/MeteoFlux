@@ -1,0 +1,376 @@
+#!/usr/bin/python
+
+# This script gets data from RAM disk and copies them to final destination,
+# possibly acting compression (on raw data). Then, it deletes data
+# older than a pre-defined survival time (typically 1 year, but users may
+# configure it).
+
+# The script is designed to:
+# - Be activated by 'usa_acq' program at hour end
+# - Wait for 'datalogger' data to be available, if any.
+# This convention makes sense as datalogger may or may not be started,
+# but sonic data acquisition is always on. Would this assumption change,
+# this script will need some rework (nothing dramatic: the most common
+# scenarios lead to simple implementations).
+
+import time
+import sys
+import glob
+import os
+from stat import *
+import shutil
+import calendar
+import logging
+import yaml
+
+# Steering constants (please change as appropriate)
+DAYS_SURVIVAL = 2*366
+DATA_ARCHIVE  = "/mnt/data"
+WAITING_TIME  = 5
+COMPRESS      = True
+
+def removeDataDirsBefore(dataDir, limitTime):
+	
+	# Locate sub-directories in dataDir
+	d = glob.glob(dataDir)
+	for name in d:
+		if os.path.isdir(name):
+		
+			# Isolate the ones exactly 6 characters long
+			(baseName, dirName) = os.path.split(name)
+			if len(dirName) == 6:
+			
+				# Try converting directory name to a time instant and,
+				# if it is less than the backwards limit time, all its
+				# content and the directory itself are removed.
+				dirYear  = dirName[0:4]
+				dirMonth = dirName[4:6]
+				try:
+					dirTime  = "%s-%s-01 00:00:00" % (dirYear, dirMonth)
+					dirInstant = time.strptime(dirTime, "%Y-%m-%d %H:%M:%S")
+					dirEpoch   = calendar.timegm(dirInstant)
+				except:
+					dirEpoch = limitTime + 1	# So the test will fail and the directory will be preserved
+				if dirEpoch < limitTime:
+					os.system("rm -f -r " + name)
+					print "Path " + name + " has been removed."
+
+
+def FreeDiskSpace():
+	
+	f = os.statvfs("/mnt/data")
+	return f.f_bsize * f.f_bavail
+	
+FUSE = 3600
+
+if __name__ == "__main__":
+
+	# Initialize
+	dataLoggerDir = "/mnt/ramdisk/"
+
+	# Generate input file names based on current hour (the hour of data files
+	# is one less than now's, as it refers to the first complete hour)
+	hourBefore = time.time() - 3600 + FUSE
+	nowTime = time.gmtime(hourBefore)
+	iYear   = nowTime[0]
+	iMonth  = nowTime[1]
+	iDay    = nowTime[2]
+	iHour   = nowTime[3]
+	inputFile      = "/mnt/ramdisk/%4.4d%2.2d%2.2d.%2.2dR" % (iYear, iMonth, iDay, iHour)
+	processedFile  = "/mnt/ramdisk/%4.4d%2.2d%2.2d.%2.2dp" % (iYear, iMonth, iDay, iHour)
+	diagnosticFile = "/mnt/ramdisk/%4.4d%2.2d%2.2d.%2.2dd" % (iYear, iMonth, iDay, iHour)
+	inputFileTime  = "%4.4d%2.2d%2.2d.%2.2d" % (iYear, iMonth, iDay, iHour)
+	
+	# Get back date and time from file names
+	inputFilePart = inputFile[-12:]
+	inputFileTime = inputFilePart[:-1]
+	yrStr = inputFileTime[0:4]
+	moStr = inputFileTime[4:6]
+	dyStr = inputFileTime[6:8]
+	hrStr = inputFileTime[9:11]
+	tmStr = "%s-%s-%s %s" % (yrStr, moStr, dyStr, hrStr)
+	
+	# Start logger
+	logging.basicConfig(level=logging.INFO, filename="/mnt/logs/archive.log", filemode="w")
+	logger = logging.getLogger("archive")
+	logger.info(time.strftime("%Y-%m-%d %H:%M:%S",time.gmtime()) + " - Starting execution")
+	
+	# Log execution data
+	logger.info(time.strftime("%Y-%m-%d %H:%M:%S",time.gmtime()) + " - Input file    = %s", inputFile)
+	logger.info(time.strftime("%Y-%m-%d %H:%M:%S",time.gmtime()) + " - Date and time = %s", tmStr)
+
+	# Retrieve datalogger map, if any
+	dataTables = []
+	if os.path.isfile("/mnt/ramdisk/dataloggerSets.yaml"):
+		cfgFile = open("/mnt/ramdisk/dataloggerSets.yaml", "r")
+		cfg     = yaml.safe_load(cfgFile)
+		cfgFile.close()
+		dataSets = cfg["DataSets"]
+		for key in dataSets:
+			dataTables.append(key)
+		logger.info(time.strftime("%Y-%m-%d %H:%M:%S",time.gmtime()) + " - Data logger table list read")
+	else:
+		logger.info(time.strftime("%Y-%m-%d %H:%M:%S",time.gmtime()) + " - Data logger table list not found")
+	
+	# Build datalogger file names corresponding to previous hour
+	sDateTime = "%4.4d-%2.2d-%2.2d %2.2d:00:00" % (iYear, iMonth, iDay, iHour)
+	
+	filePrefix = []
+	for table in dataTables:
+		filePrefix.append(table + "_")
+	logger.info(time.strftime("%Y-%m-%d %H:%M:%S",time.gmtime()) + " - File prefixes generated")
+	
+	# Generate GPS event file name from sonic files
+	gpsFile = inputFile[:-1] + "G"
+
+	# Get date and time from input file name
+	lenFile = len(inputFile)
+	sFile  = inputFile[lenFile-12:lenFile]
+	sYear  = sFile[0:4]
+	sMonth = sFile[4:6]
+	sDay   = sFile[6:8]
+	sHour  = sFile[9:11]
+	logger.info(time.strftime("%Y-%m-%d %H:%M:%S",time.gmtime()) + " - Input file date and time retrieved: %s-%s-%s %s", sYear, sMonth, sDay, sHour)
+	
+	# Compress original raw sonic file, in preparation to transfer
+	# (if not compressed already - which doesn't happens in normal use,
+	# but can be during debug sessions).
+	if COMPRESS:
+		if os.path.isfile(inputFile) and not os.path.isfile(inputFile + ".gz"):
+			os.system("gzip %s" % inputFile)
+			logger.info(time.strftime("%Y-%m-%d %H:%M:%S",time.gmtime()) + " - Raw sonic data compressed")
+		else:
+			logger.info(time.strftime("%Y-%m-%d %H:%M:%S",time.gmtime()) + " - No war sonic file to compress found")
+	else:
+		logger.info(time.strftime("%Y-%m-%d %H:%M:%S",time.gmtime()) + " - Raw sonic data not compressed (COMPRESS == False)")
+	
+	# Transfer original files to their archive destination. Then delete originals.
+	# If destination files already exist (they may do, due to a download action
+	# commanded by user) overwrite them. This causes the loss of data. Leaving
+	# the old data card in place instead of using another one is positively not
+	# recommended however.
+	# -1- Raw data
+	outFile = ""
+	if COMPRESS:
+		if os.path.isfile(inputFile + ".gz"):
+			outDir = "/mnt/data/raw/%s%s" % (sYear, sMonth)
+
+			if not os.path.exists(DATA_ARCHIVE + "/raw"):
+				os.makedirs(DATA_ARCHIVE + "/raw")
+			if not os.path.exists(outDir):
+				os.makedirs(outDir)
+			outFile = "%s/%s.gz" % (outDir, sFile)
+			if os.path.exists(outFile):
+				os.remove(outFile)
+			shutil.copyfile(inputFile+".gz", outFile)
+			os.remove(inputFile+".gz")
+		else:
+			logger.warning(time.strftime("%Y-%m-%d %H:%M:%S",time.gmtime()) + " - Raw sonic data file not found")
+	else:
+		if os.path.isfile(inputFile):
+			outDir = "/mnt/data/raw/%s%s" % (sYear, sMonth)
+			if not os.path.exists(DATA_ARCHIVE + "/raw"):
+				os.makedirs(DATA_ARCHIVE + "/raw")
+			if not os.path.exists(outDir):
+				os.makedirs(outDir)
+			outFile = "%s/%s" % (outDir, sFile)
+			if os.path.exists(outFile):
+				os.remove(outFile)
+			shutil.copyfile(inputFile, outFile)
+			os.remove(inputFile)
+		else:
+			logger.warning(time.strftime("%Y-%m-%d %H:%M:%S",time.gmtime()) + " - Raw sonic data file not found")
+	logger.info(time.strftime("%Y-%m-%d %H:%M:%S",time.gmtime()) + " - Raw sonic data transferred")
+	sRawSonicFile = outFile
+	# -1- Processed data
+	if os.path.isfile(processedFile):
+		outDir = DATA_ARCHIVE + "/processed/%s%s" % (sYear, sMonth)
+		if not os.path.exists(DATA_ARCHIVE + "/processed"):
+			os.makedirs(DATA_ARCHIVE + "/processed")
+		if not os.path.exists(outDir):
+			os.makedirs(outDir)
+		outFile = "%s/%s%s%s.%sp" % (outDir, sYear, sMonth, sDay, sHour)
+		if os.path.exists(outFile):
+			os.remove(outFile)
+		shutil.copyfile(processedFile, outFile)
+		os.remove(processedFile)
+	else:
+		logger.warning(time.strftime("%Y-%m-%d %H:%M:%S",time.gmtime()) + " - Processed sonic data file not found")
+	logger.info(time.strftime("%Y-%m-%d %H:%M:%S",time.gmtime()) + " - Processed data transferred")
+	sProcessedSonicFile = outFile
+	# -1- Diagnostic data
+	if os.path.isfile(diagnosticFile):
+		outDir = DATA_ARCHIVE + "/diagnostic/%s%s" % (sYear, sMonth)
+		if not os.path.exists(DATA_ARCHIVE + "/diagnostic"):
+			os.makedirs(DATA_ARCHIVE + "/diagnostic")
+		if not os.path.exists(outDir):
+			os.makedirs(outDir)
+		outFile = "%s/%s%s%s.%sd" % (outDir, sYear, sMonth, sDay, sHour)
+		if os.path.exists(outFile):
+			os.remove(outFile)
+		shutil.copyfile(diagnosticFile, outFile)
+		os.remove(diagnosticFile)
+	else:
+		logger.warning(time.strftime("%Y-%m-%d %H:%M:%S",time.gmtime()) + " - Diagnostic sonic data file not found")
+	logger.info(time.strftime("%Y-%m-%d %H:%M:%S",time.gmtime()) + " - Diagnostic data transferred")
+	sDiagnosticSonicFile = outFile
+	
+	# Transfer datalogger files to their destinations, if they exist
+	svRawDataloggerFile = []
+	svProcessedDataloggerFile = []
+	svDiagnosticDataloggerFile = []
+	svAlarmDataloggerFile = []
+	for prefix in filePrefix:
+		# -1- Compress original datalogger files, if not done already
+		if COMPRESS:
+			inputDlFile = dataLoggerDir + prefix + inputFileTime + "a"
+			if os.path.isfile(inputDlFile):
+				if os.path.isfile(inputDlFile) and not os.path.isfile(inputDlFile + ".gz"):
+					os.system("/bin/gzip %s" % inputDlFile)
+				# -1- Raw data
+				if os.path.isfile(inputDlFile + ".gz"):
+					outDir = "/mnt/data/dl_raw/%s%s" % (sYear, sMonth)
+					if not os.path.exists(DATA_ARCHIVE + "/dl_raw"):
+						os.makedirs(DATA_ARCHIVE + "/dl_raw")
+					if not os.path.exists(outDir):
+						os.makedirs(outDir)
+					outFile = "%s/%s%s" % (outDir, prefix, inputFileTime + "a.gz")
+					if os.path.exists(outFile):
+						os.remove(outFile)
+					shutil.copyfile(inputDlFile+".gz", outFile)
+					os.remove(inputDlFile+".gz")
+			else:
+				logger.warning(time.strftime("%Y-%m-%d %H:%M:%S",time.gmtime()) + " - Raw '%s' file not found", prefix)
+		else:
+			inputDlFile = dataLoggerDir + prefix + inputFileTime + "a"
+			if os.path.isfile(inputDlFile):
+
+				# -1- Raw data
+				outDir = "/mnt/data/dl_raw/%s%s" % (sYear, sMonth)
+				if not os.path.exists(DATA_ARCHIVE + "/dl_raw"):
+					os.makedirs(DATA_ARCHIVE + "/dl_raw")
+				if not os.path.exists(outDir):
+					os.makedirs(outDir)
+				outFile = "%s/%s%s" % (outDir, prefix, inputFileTime + "a")
+				if os.path.exists(outFile):
+					os.remove(outFile)
+				shutil.copyfile(inputDlFile, outFile)
+				os.remove(inputDlFile)
+			else:
+				logger.warning(time.strftime("%Y-%m-%d %H:%M:%S",time.gmtime()) + " - Raw '%s' file not found", prefix)
+			svRawDataloggerFile.append(outFile)
+		logger.info(time.strftime("%Y-%m-%d %H:%M:%S",time.gmtime()) + " - Raw %s data transferred", prefix)
+		# -1- Processed data
+		processedDlFile = dataLoggerDir + prefix + inputFileTime + "q"
+		if os.path.isfile(processedDlFile):
+			outDir = DATA_ARCHIVE + "/dl_processed/%s%s" % (sYear, sMonth)
+			if not os.path.exists(DATA_ARCHIVE + "/dl_processed"):
+				os.makedirs(DATA_ARCHIVE + "/dl_processed")
+			if not os.path.exists(outDir):
+				os.makedirs(outDir)
+			outFile = "%s/%s%s%s%s.%sq" % (outDir, prefix, sYear, sMonth, sDay, sHour)
+			if os.path.exists(outFile):
+				os.remove(outFile)
+			shutil.copyfile(processedDlFile, outFile)
+			os.remove(processedDlFile)
+		else:
+			logger.warning(time.strftime("%Y-%m-%d %H:%M:%S",time.gmtime()) + " - Processed '%s' file not found", prefix)
+		svProcessedDataloggerFile.append(outFile)
+		logger.info(time.strftime("%Y-%m-%d %H:%M:%S",time.gmtime()) + " - Processed %s data transferred", prefix)
+		# -1- Diagnostic data
+		diagnosticDlFile = dataLoggerDir + prefix + inputFileTime + "g"
+		if os.path.isfile(diagnosticDlFile):
+			outDir = DATA_ARCHIVE + "/dl_diagnostic/%s%s" % (sYear, sMonth)
+
+			if not os.path.exists(DATA_ARCHIVE + "/dl_diagnostic"):
+				os.makedirs(DATA_ARCHIVE + "/dl_diagnostic")
+			if not os.path.exists(outDir):
+				os.makedirs(outDir)
+			outFile = "%s/%s%s%s%s.%sg" % (outDir, prefix, sYear, sMonth, sDay, sHour)
+			if os.path.exists(outFile):
+				os.remove(outFile)
+			shutil.copyfile(diagnosticDlFile, outFile)
+			os.remove(diagnosticDlFile)
+		else:
+			logger.warning(time.strftime("%Y-%m-%d %H:%M:%S",time.gmtime()) + " - Diagnostic '%s' file not found", prefix)
+		svDiagnosticDataloggerFile.append(outFile)
+		logger.info(time.strftime("%Y-%m-%d %H:%M:%S",time.gmtime()) + " - Diagnostic %s data transferred", prefix)
+		# -1- Alarm data
+		alarmDlFile = dataLoggerDir + prefix + inputFileTime + "f"
+		if os.path.isfile(alarmDlFile):
+			outDir = DATA_ARCHIVE + "/dl_alarm/%s%s" % (sYear, sMonth)
+			if not os.path.exists(DATA_ARCHIVE + "/dl_alarm"):
+				os.makedirs(DATA_ARCHIVE + "/dl_alarm")
+			if not os.path.exists(outDir):
+				os.makedirs(outDir)
+			outFile = "%s/%s%s%s%s.%sf" % (outDir, prefix, sYear, sMonth, sDay, sHour)
+			if os.path.exists(outFile):
+				os.remove(outFile)
+			shutil.copyfile(alarmDlFile, outFile)
+			os.remove(alarmDlFile)
+		else:
+			logger.warning(time.strftime("%Y-%m-%d %H:%M:%S",time.gmtime()) + " - Alarm '%s' file not found", prefix)
+		svAlarmDataloggerFile.append(outFile)
+		logger.info(time.strftime("%Y-%m-%d %H:%M:%S",time.gmtime()) + " - Alarm %s data transferred", prefix)
+	
+	# Transfer GPS time realign event file
+	if os.path.isfile(gpsFile):
+		outDir = DATA_ARCHIVE + "/gps_events/%s%s" % (sYear, sMonth)
+		if not os.path.exists(DATA_ARCHIVE + "/gps_events"):
+			os.makedirs(DATA_ARCHIVE + "/gps_events")
+		if not os.path.exists(outDir):
+			os.makedirs(outDir)
+		outFile = "%s/%s%s%s.%sG" % (outDir, sYear, sMonth, sDay, sHour)
+		if os.path.exists(outFile):
+			os.remove(outFile)
+		shutil.copyfile(gpsFile, outFile)
+		os.remove(gpsFile)
+		logger.info(time.strftime("%Y-%m-%d %H:%M:%S",time.gmtime()) + " - GPS event file transferred")
+	else:
+		logger.info(time.strftime("%Y-%m-%d %H:%M:%S",time.gmtime()) + " - GPS event file not present")
+	
+	# Remove all data belonging to months older than DAYS_SURVIVAL days
+	now = time.time() + FUSE
+	limitTime = now - DAYS_SURVIVAL*24*3600
+	removeDataDirsBefore(DATA_ARCHIVE + "/raw/*", limitTime)
+	removeDataDirsBefore(DATA_ARCHIVE + "/processed/*", limitTime)
+	removeDataDirsBefore(DATA_ARCHIVE + "/diagnostic/*", limitTime)
+	removeDataDirsBefore(DATA_ARCHIVE + "/dl_raw/*", limitTime)
+	removeDataDirsBefore(DATA_ARCHIVE + "/dl_processed/*", limitTime)
+	removeDataDirsBefore(DATA_ARCHIVE + "/dl_diagnostic/*", limitTime)
+	removeDataDirsBefore(DATA_ARCHIVE + "/dl_alarm/*", limitTime)
+	logger.info(time.strftime("%Y-%m-%d %H:%M:%S",time.gmtime()) + " - Old data removed, if in case")
+
+	# Activate, if present, the local ("personalization") task
+	if os.path.isfile("/home/standard/local/post.py"):
+
+		# Prepare input for personalization task
+		f = open("/mnt/ramdisk/post.ini", "w")
+		f.write(sRawSonicFile + "\n")
+		f.write(sProcessedSonicFile + "\n")
+		f.write(sDiagnosticSonicFile + "\n")
+		f.write("%d\n" % len(svRawDataloggerFile))
+		for i in range(len(svRawDataloggerFile)):
+			f.write(svRawDataloggerFile[i] + "\n")
+			f.write(svProcessedDataloggerFile[i] + "\n")
+			f.write(svDiagnosticDataloggerFile[i] + "\n")
+			f.write(svAlarmDataloggerFile[i] + "\n")
+		f.close()
+		logger.info(time.strftime("%Y-%m-%d %H:%M:%S",time.gmtime()) + " - Post-processor init file created")
+
+		# Perform local processing
+		sDateTime = tmStr + ":00:00"
+		os.system("/home/standard/local/post.py /home/standard/cfg/pre.cfg \"%s\"" % (sDateTime))
+		logger.info(time.strftime("%Y-%m-%d %H:%M:%S",time.gmtime()) + " - Post-processor terminated")
+		
+	else:
+		
+		logger.warning(time.strftime("%Y-%m-%d %H:%M:%S",time.gmtime()) + " - Post-processor not present, and hence not launched")
+	
+	# Transfer data to fintemporary transmission destination
+	#iRetCode = os.system("/home/standard/sender/snd.py /home/standard/cfg/transfer.cfg")
+	#logger.info(time.strftime("%Y-%m-%d %H:%M:%S",time.gmtime()) + " - Transmission executed")
+	
+	# Leave
+	logger.info(time.strftime("%Y-%m-%d %H:%M:%S",time.gmtime()) + " - Execution completed successfully")
+	sys.exit(0)
